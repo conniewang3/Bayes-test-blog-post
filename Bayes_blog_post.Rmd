@@ -1,0 +1,775 @@
+---
+title: "An Exploration of Bayesian A/B Testing"
+author: "Connie Wang"
+date: "6/18/2020"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+# Doc settings
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+
+# Importing libraries
+library(tidyverse)
+library(bayesAB)
+library(pwr)
+library(grid)
+```
+
+So I've recently been looking into using a Bayesian interpretation of A/B test results for work, and have found the discussion so interesting that I've decided to write about it! In particular, I'm fascinated at how much disagreement there seems to be among data scientists and statisticians about the validity of early stopping in Bayesian testing -- this made me want to do a little testing of my own. If you also have feelings/knowledge about Bayesian statistics, I'd love to discuss this topic with you, but did not feel like figuring out how to enable comments on this blog -- please send me an email/fb message/linkedin message.
+
+I wasn't able to do everything I wanted to in this one post (part 2 coming soon), but my takeaway so far is that Bayesian testing is a good alternative to traditional hypothesis tests for AB testing, when you have some prior knowledge of the test metric, and especially when you have unevenly split groups (i.e. 90/10 rather than 50/50). However, the assertion that "early peeking is fine" is more of a philosophical difference than an actual increase in statistical robustness, and should be taken with a grain of salt. In some ways, using Bayes testing (especially if you're going to early-stop) trades away rigor for statistial power. However, I still think it delivers trustworthy and useful results, and am planning to use it as my preferred AB testing framework.
+
+## First, some background
+### A quick refresher on A/B testing
+Probably the most common experiment most companies perform, A/B testing is an experimental setup that weighs two options against each other. In the most basic version, a sample of users is split in half, with one half getting version A and the other getting version B -- for example, a website could test the performance of blue button vs. an orange one. It would route a random half of its visitors to a page with a blue button, and the other half to a page with an orange button. After a while, it would do some analysis to see if there's a statistically significant difference in how often each button was clicked.
+
+### What does "Bayesian" mean in this context anyway?
+Bayesian inference is a type of statistical inference we can use to draw conclusions from data. The hallmark of Bayesian inference is that it uses a subjective perspective on the problem as a starting point -- that is,the Bayesian approach uses a "prior" distribution that represents your existing belief about the distribution of a random variable, and then uses observed data to update that knowledge and build a "posterior" distribution. 
+
+"Bayesian" A/B testing refers to using a Bayesian approach to interpret the result of an A/B test. I think the best way to explain this is to re-use the simple orange vs. blue button example from the previous section. Before the A/B test starts, you identify your prior beliefs: maybe you had a black button on your site already, and each day between 25% and 50% of visitors clicked the button, so you say that the probability of a button being clicked on your site is between 25% and 50%. You can use that to build a "prior" distribution for the probability of any button being clicked. Then, as the A/B test starts, you have two groups: orange and blue. The observations of how many people click each color button gets appended to your prior distribution, and you end up with two "posterior" distributions that represent the probability of each button being clicked. You can then compare your orange distribution to your blue distribution and say things like "there's a 95% chance that the blue button is more likely to be clicked than the orange button".
+
+### How does this differ from hypothesis testing?
+Frequentist hypothesis testing is what many of us learned in high school: dig real deep and try to remember writing things like "p = 0.05 so we reject the null hypothesis with 95% confidence", or something like that. Frequentist inference operates under a totally different philosophy from Bayesian inference; where Bayesian inference relies on a subjective set of beliefs (i.e., different people can come up with different priors and end up with different results), frequentist inference is objective (the same observations will always give you the same answers). Frequentist inference says "our observations are all we have to rely on, and they represent only a sample of the infinite possible draws of the data (e.g. flips of a coin)". It doesn't use or give any probability distributions. Instead, it asks something more like "if we repeated this experiment infinity times, what are the chances that we would observe this result if the hypothesis we set were true?". 
+
+Applying that to the A/B test example we've been using, a frequentist analysis would look something like this: we observe that the blue button was clicked by a certain proportion of visitors, and the orange button was clicked by a certain other proportion of visitors. Our analysis outputs a p-value based on how big the sample size is and how different the observations in each group are from each other. The p-value tells us the probability that we'd see these observations or more extreme if there were actually no difference between the two groups. We decide on an acceptable level of error (usually 5%), and say for example "the blue button is more likely to be clicked with 95% confidence", which means "if we had an infinite number of parallel universes to run this experiment in, and we concluded the blue button is better in each universe, we'd be wrong in 5% of universes". Note that this is a different statement from the Bayesian one above: "there's a 95% chance that the blue button is more likely to be clicked".
+
+### My motivations for investigating Bayes tests
+I was initially drawn to Bayes testing because I find it to be more intuitive to interpret than hypothesis testing (especially for those without a background in statistics). Additionally, like most companies who are not Google or Facebook, we often struggle with getting a large enough sample size for significant results; it seemed to me that using a Bayes test would make it easier to reach useful outcomes by a) being able to incorporate prior knowledge and b) outputting distributions rather than a p-value. Some people also claim that Bayesian testing is immune to peeking, unlike hypothesis testing, which allows you to save time and stop tests early.
+
+"More interpretable results" is a benefit that doesn't require any investigation, but I'm not so sure about "faster to reach useful outcomes" and "ability to early-stop". Besides that, there are a couple other things that are unclear to me about Bayes tests, even after some internet-scouring. For one, hypothesis testing gives an explicit promise regarding Type I error (p-value, a.k.a. the probability of seeing a difference when there is none) and Type II error (power, a.k.a. the probability of not seeing a difference when there is one), but the Bayesian interpretation doesn't -- what kind of Type I/II error should I actually expect with Bayes testing? Another complication with Bayes test is choice of prior -- what happens if I choose a prior that's very strict or very diffuse? What if I choose one that's just wrong? Finally, hypothesis testing is an extremely widely accepted way of analyzing A/B test results, and my company doesn't currently use Bayes tests for this purpose. So, there's some burden of proof in showing that a Bayesian approach won't cause us to draw wildly inaccurate conclusions.
+
+### Objectives, and how we'll get there
+This post will attempt to answer the following questions:
+
+* What kind of Type I and Type II error rate are we dealing with if we use a Bayesian approach to A/B testing?
+* How does early stopping (aka "peeking") affect the Type I error rate in Bayes testing?
+
+I'll be tackling these additional two in a future post:
+* How large of a sample does it take to see a significant result in Bayes vs hypothesis testing?
+* How does choice of prior affect the Type I/II error rate of Bayes tests?
+
+To answer these questions, I'll be simulating a couple situations to see how the test behaves in each one:
+
+* Bernoulli data with no difference | a small difference | a large difference
+* Bernoulli data with a 90/10 split
+* Bernoulli data with a small difference and low baseline
+* Poisson data with no difference | some difference
+
+I'll represent these situations as comparisons of simulated "populations" of 10,000 random trials. For the purposes of Bayesian analysis, I'll make up a prior for each population that will represent my beliefs about the population proportions (in the case of bernoulli variables) or means (in the poisson case). I've plotted the priors of the 6 simulated A/B test comparisons below so that we can visualize them. When I actually run the Bayes test, I'll use the prior for group A as the prior for the test (analogous to A being a control group and B being the treatment group).
+
+```{r plot_priors}
+# Simulated data
+binom_03 <- rbinom(10000, 1, .03)
+binom_05 <- rbinom(10000, 1, .05)
+binom_3 <- rbinom(10000, 1, .3)
+binom_4 <- rbinom(10000, 1, .4)
+binom_45 <- rbinom(10000, 1, .45)
+binom_small_03 <- rbinom(1111, 1, .03)
+pois_6 <- rpois(10000, 6)
+pois_5 <- rpois(10000, 5)
+
+# Priors for each distribution
+binom_03_prior <- c(10, 300)
+binom_05_prior <- c(17, 300)
+binom_3_prior <- c(46, 100)
+binom_4_prior <- c(67, 100)
+binom_45_prior <- c(82, 100)
+pois_5_prior <- c(301, 60)
+pois_6_prior <- c(361, 60)
+
+# Generate plots of the priors for the 7 comparisons -- beta for bernoulli and gamma for poisson
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(5, 3, heights = unit(c(0.5, 5, 0.5, 0.5, 5), "null"))))
+
+binom_03_plot <- plotBeta(10,300) + theme(title = element_blank(), 
+                                          axis.title = element_blank(), 
+                                          axis.text.y = element_blank(), 
+                                          panel.grid = element_blank())
+binom_05_plot <- plotBeta(17,300) + theme(title = element_blank(), 
+                                          axis.title = element_blank(), 
+                                          axis.text.y = element_blank(), 
+                                          panel.grid = element_blank())
+binom_3_plot <- plotBeta(46,100) + theme(title = element_blank(), 
+                                          axis.title = element_blank(), 
+                                          axis.text.y = element_blank(), 
+                                          panel.grid = element_blank())
+binom_4_plot <- plotBeta(67,100) + theme(title = element_blank(), 
+                                          axis.title = element_blank(), 
+                                          axis.text.y = element_blank(), 
+                                          panel.grid = element_blank())
+binom_45_plot <- plotBeta(82,100) + theme(title = element_blank(), 
+                                          axis.title = element_blank(), 
+                                          axis.text.y = element_blank(), 
+                                          panel.grid = element_blank())
+pois_5_plot <- plotGamma(301,60) + xlim(0, 8) + theme(title = element_blank(), 
+                                          axis.title = element_blank(), 
+                                          axis.text.y = element_blank(), 
+                                          panel.grid = element_blank())
+pois_6_plot <- plotGamma(361,60) + xlim(0, 8) + theme(title = element_blank(),
+                                          axis.title = element_blank(), 
+                                          axis.text.y = element_blank(), 
+                                          panel.grid = element_blank())
+
+grid.text("1: Bernoulli, no difference", vp = viewport(layout.pos.row = 1, 
+                                                       layout.pos.col = 1))
+print(binom_4_plot, vp = viewport(layout.pos.row = 2, 
+                                  layout.pos.col = 1))
+print(binom_4_plot, vp = viewport(layout.pos.row = 2, 
+                                  layout.pos.col = 1))
+
+grid.text("2: Bernoulli, small difference", vp = viewport(layout.pos.row = 1, 
+                                                          layout.pos.col = 2))
+print(binom_4_plot, vp = viewport(layout.pos.row = 2, 
+                                  layout.pos.col = 2))
+print(binom_45_plot, vp = viewport(layout.pos.row = 2, 
+                                   layout.pos.col = 2))
+
+grid.text("3: Bernoulli, large difference", vp = viewport(layout.pos.row = 1, 
+                                                          layout.pos.col = 3))
+print(binom_3_plot, vp = viewport(layout.pos.row = 2, 
+                                   layout.pos.col = 3))
+print(binom_4_plot, vp = viewport(layout.pos.row = 2, 
+                                  layout.pos.col = 3))
+
+grid.text("4: Bernoulli, low baseline", vp = viewport(layout.pos.row = 4, 
+                                                      layout.pos.col = 1))
+print(binom_03_plot + xlim(0, 0.5), vp = viewport(layout.pos.row = 5, 
+                                                  layout.pos.col = 1))
+print(binom_05_plot + xlim(0, 0.5), vp = viewport(layout.pos.row = 5, 
+                                                  layout.pos.col = 1))
+
+grid.text("5: Poisson, no difference", vp = viewport(layout.pos.row = 4, 
+                                                     layout.pos.col = 2))
+print(pois_5_plot, vp = viewport(layout.pos.row = 5, 
+                                 layout.pos.col = 2))
+print(pois_5_plot, vp = viewport(layout.pos.row = 5, 
+                                 layout.pos.col = 2))
+
+grid.text("6: Poisson, large difference", vp = viewport(layout.pos.row = 4, 
+                                                       layout.pos.col = 3))
+print(pois_5_plot, vp = viewport(layout.pos.row = 5, 
+                                 layout.pos.col = 3))
+print(pois_6_plot, vp = viewport(layout.pos.row = 5, 
+                                 layout.pos.col = 3))
+```
+
+## How much type I/II error do we incur using Bayesian stopping rules?
+### Even more background on type I/II errors in A/B tests
+In A/B testing, Type I/II error rate refers to the probability of thinking that A and B are different when they're really the same (type I) or thinking that A and B are the same when they're really different (type 2). 
+
+In frequentist hypothesis testing, we set a threshold for significance based on the p-value, which directly sets a maximum type I error rate -- that is, if we call a difference "significant" in an hypothesis test, we're saying that the type I error rate (probability of thinking A and B are different when they're really the same) is below our threshold p-value. Additionally, it's standard practice to choose a sample size before the test begins by estimating some parameters and setting a maximum type II error rate, called the "power". To give a concrete example, a hypothesis test with p = 0.05 and power = 80% will have a 5% probability of type I error and a 20% probability of type II error.
+
+On the other hand, Bayes testing (Bayesian inference in general, really) has the goal of making the best decision from your perspective using the data and beliefs that you have, so it doesn't explicitly concern itself with type I and II error. In fact, your error rates will vary depending on the prior you choose, even if the data is the exact same. Instead of using p-value (aka type I error rate) as a stopping rule, we have a couple options with Bayes tests: "Expected loss" is the most commonly used stopping rule, and represents the loss we'd expect to incur if we chose the wrong option; another one that interests me is "probability that A > B", or P(A>B). I'm not usually one to buck the accepted standard, but I have a hard time wrapping my mind around how "expected loss" is mathematically derived, and "there's an X% that test is better than control" is a the most intuitive possible explanation of an A/B test result anyway, in my opinion -- so, I think this (seemingly less commonly-used?) stopping rule is definitely worth investigating! So, I'll be using P(A>B) throughout this blog post.
+
+### For tests of the same sample size, Bayes testing generally has a slightly lower type I error rate than hypothesis testing, especially for data with a 90/10 split
+To calculate type I error rate, we'll run some Bayes and hypothesis tests where group A and group B are in fact identical, and see how many of the tests falsely detect a significant difference. Our decision rules for each test are: two-tailed p-value <= 0.05 (hypothesis); probability that A and B are different >= 95% (i.e., P(A>B) >= 97.5% or <= 2.5%) (Bayes). We'll also simulate 4 different types of data: Bernoulli data split 50/50, Poisson data split 50/50, Bernoulli data split 90/10, and Bernoulli data with a low baseline rate. I'll use the arbitrarily-chosen-but-reasonable-looking priors from the section above for my Bayes tests. 
+
+I used 500 tests of 1000 total samples in each estimation of type I error rate, estimated the rate 3 times, and plotted the median with min and max as error bars. Not the most rigorous of error bars, but just enough to get a sense of how much this metric changes from run to run (without waiting 5 million years for this code to run!). 
+
+The resulting bar chart (below) shows that Bayes testing results in a slightly lower type I error in most cases. With a 90/10 split, there's an especially noticeable difference, and with Poisson data, the two tests are comparable.
+
+Some caveats here: 1) because I knew what the actual population proportion/mean was here, I was able to choose an accurate prior for the Bayes test (we'll investigate how choice of prior impacts error rate a little later on in this post), 2) "p <= 0.05" and "95% probability of difference" aren't exactly the same thing, so doing this comparison may be a little misleading -- however, I chose these decision rules for the comparison because they're probably what I would use by default if I were running a real A/B test, so they're an applicable way for me to compare these two methods.
+
+```{r type_i_error}
+# Define a function to run a Bayes test and get expected loss, probability A > B, and bounds of 95% credible interval
+bayes_test <- function(A, B, prior, distribution) {
+  if (distribution == "bernoulli") {
+    x <- summary(bayesTest(A, B, 
+                           priors = c('alpha' = prior[1], 'beta' = prior[2]), 
+                           n_samples = 1e5, 
+                           distribution = distribution))
+  } else if (distribution == "poisson") {
+    x <- summary(bayesTest(A, B, 
+                           priors = c('shape' = prior[1], 'rate' = prior[2]), 
+                           n_samples = 1e5, 
+                           distribution = distribution))
+  }
+  output <- tibble("prob" = x$probability[[1]], 
+                   "loss" = x$posteriorExpectedLoss[[1]], 
+                   "lower" = x$interval[[1]][1], 
+                   "upper" = x$interval[[1]][2])
+  return(output)
+}
+
+# Define a function to run a hypothesis test and get p-value, power, and bounds of 95% confidence interval
+hyp_test <- function(A, B, distribution) {
+  if (distribution == "bernoulli") {
+    # hypothesis test
+    x <- prop.test(c(sum(A), sum(B)), c(length(A), length(B)))
+    # power analysis
+    y <- pwr.2p2n.test(n1 = length(A), n2 = length(B), 
+                       sig.level = x$p.value, 
+                       h = ES.h(p1 = sum(A)/length(A), 
+                                p2 = sum(B)/length(B)))$power
+  } else if (distribution == "poisson") {
+    # hypothesis test
+    x <- poisson.test(c(sum(A), sum(B)), c(length(A), length(B)))
+    # power calculation from http://www.pmean.com/10/PoissonPower.html
+    y <- pnorm( log((sum(A)*length(B)) / (sum(B)*length(A))) / 
+                  sqrt(1/sum(A) + 1/sum(B)) 
+                - qnorm(1-x$p.value/2) )
+  }
+  output <- tibble("pvalue" = x$p.value, 
+                   "power" = y, 
+                   "lower" = x$conf.int[1], 
+                   "upper" = x$conf.int[2])
+  return(output)
+}
+
+# Run 500 hypothesis tests for each situation and see what % have p-value <= 0.05. Repeat process 3 times.
+hyp_type_i <- tibble("n" = seq(1, 500)) %>%
+  group_by(n) %>%
+  mutate("bernoulli" = hyp_test(sample(binom_4, 500), 
+                                sample(binom_4, 500), 
+                                "bernoulli")$pvalue,
+         "poisson" = hyp_test(sample(pois_5, 500), 
+                              sample(pois_5, 500), 
+                              "poisson")$pvalue,
+         "bernoulli_9010" = hyp_test(sample(binom_4, 100), 
+                                     sample(binom_4, 900), 
+                                     "bernoulli")$pvalue,
+         "bernoulli_low" = hyp_test(sample(binom_03, 500), 
+                                    sample(binom_03, 500), 
+                                    "bernoulli")$pvalue) %>%
+  ungroup() %>%
+  summarize("bernoulli" = sum(bernoulli <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli)),
+            "poisson" = sum(poisson <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(poisson)),
+            "bernoulli 90/10" = sum(bernoulli_9010 <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli_9010)),
+            "bernoulli low baseline" = sum(bernoulli_low <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli_low))) %>%
+  rbind(tibble("n" = seq(1, 500)) %>%
+    group_by(n) %>%
+    mutate("bernoulli" = hyp_test(sample(binom_4, 500), 
+                                  sample(binom_4, 500), 
+                                  "bernoulli")$pvalue,
+           "poisson" = hyp_test(sample(pois_5, 500), 
+                                sample(pois_5, 500), 
+                                "poisson")$pvalue,
+           "bernoulli_9010" = hyp_test(sample(binom_4, 100), 
+                                       sample(binom_4, 900), 
+                                       "bernoulli")$pvalue,
+           "bernoulli_low" = hyp_test(sample(binom_03, 500), 
+                                      sample(binom_03, 500), 
+                                      "bernoulli")$pvalue) %>%
+    ungroup() %>%
+    summarize("bernoulli" = sum(bernoulli <= 0.05, na.rm = TRUE) / 
+                            sum(!is.na(bernoulli)),
+              "poisson" = sum(poisson <= 0.05, na.rm = TRUE) / 
+                            sum(!is.na(poisson)),
+              "bernoulli 90/10" = sum(bernoulli_9010 <= 0.05, na.rm = TRUE) / 
+                            sum(!is.na(bernoulli_9010)),
+              "bernoulli low baseline" = sum(bernoulli_low <= 0.05, na.rm = TRUE) / 
+                            sum(!is.na(bernoulli_low)))) %>%
+  rbind(tibble("n" = seq(1, 500)) %>%
+    group_by(n) %>%
+    mutate("bernoulli" = hyp_test(sample(binom_4, 500), 
+                                  sample(binom_4, 500), 
+                                  "bernoulli")$pvalue,
+           "poisson" = hyp_test(sample(pois_5, 500), 
+                                sample(pois_5, 500), 
+                                "poisson")$pvalue,
+           "bernoulli_9010" = hyp_test(sample(binom_4, 100), 
+                                       sample(binom_4, 900), 
+                                       "bernoulli")$pvalue,
+           "bernoulli_low" = hyp_test(sample(binom_03, 500), 
+                                      sample(binom_03, 500), 
+                                      "bernoulli")$pvalue) %>%
+    ungroup() %>%
+    summarize("bernoulli" = sum(bernoulli <= 0.05, na.rm = TRUE) / 
+                            sum(!is.na(bernoulli)),
+              "poisson" = sum(poisson <= 0.05, na.rm = TRUE) / 
+                            sum(!is.na(poisson)),
+              "bernoulli 90/10" = sum(bernoulli_9010 <= 0.05, na.rm = TRUE) / 
+                            sum(!is.na(bernoulli_9010)),
+              "bernoulli low baseline" = sum(bernoulli_low <= 0.05, na.rm = TRUE) / 
+                            sum(!is.na(bernoulli_low)))) %>%
+  pivot_longer(everything(), names_to = "dist") %>%
+  group_by(dist) %>%
+  summarize("min" = min(value), "max" = max(value), "mid" = median(value)) %>%
+  mutate("test" = "hypothesis")
+
+# Run 500 Bayes tests for each situation and see what % have P(A > B) >= 97.5% or <= 2.5%. Repeat process 3 times.
+bayes_type_i <- tibble("n" = seq(1, 500)) %>%
+  group_by(n) %>%
+  mutate("bernoulli" = bayes_test(sample(binom_4, 500), 
+                                  sample(binom_4, 500), 
+                                  binom_4_prior, "bernoulli")$prob,
+         "poisson" = bayes_test(sample(pois_5, 500), 
+                                sample(pois_5, 500), 
+                                pois_5_prior, "poisson")$prob,
+         "bernoulli_9010" = bayes_test(sample(binom_4, 100), 
+                                       sample(binom_4, 900), 
+                                       binom_4_prior, "bernoulli")$prob,
+         "bernoulli_low" = bayes_test(sample(binom_03, 500), 
+                                      sample(binom_03, 500), 
+                                      binom_03_prior, "bernoulli")$prob) %>%
+  ungroup() %>%
+  summarize("bernoulli" = sum(bernoulli >= 0.975 | bernoulli <= 0.025, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli)),
+            "poisson" = sum(poisson >= 0.975 | poisson <= 0.025, na.rm = TRUE) / 
+                        sum(!is.na(poisson)),
+            "bernoulli 90/10" = sum(bernoulli_9010 >= 0.975 | bernoulli_9010 <= 0.025, na.rm = TRUE) /
+                                sum(!is.na(bernoulli_9010)),
+            "bernoulli low baseline" = sum(bernoulli_low >= 0.975 | bernoulli_low <= 0.025, na.rm = TRUE) /
+                                       sum(!is.na(bernoulli_low))) %>%
+  rbind(tibble("n" = seq(1, 500)) %>%
+    group_by(n) %>%
+    mutate("bernoulli" = bayes_test(sample(binom_4, 500), 
+                                    sample(binom_4, 500), 
+                                    binom_4_prior, "bernoulli")$prob,
+           "poisson" = bayes_test(sample(pois_5, 500), 
+                                  sample(pois_5, 500), 
+                                  pois_5_prior, "poisson")$prob,
+           "bernoulli_9010" = bayes_test(sample(binom_4, 100), 
+                                         sample(binom_4, 900),
+                                         binom_4_prior, "bernoulli")$prob,
+           "bernoulli_low" = bayes_test(sample(binom_03, 500), 
+                                        sample(binom_03, 500), 
+                                        binom_03_prior, "bernoulli")$prob) %>%
+    ungroup() %>%
+    summarize("bernoulli" = sum(bernoulli >= 0.975 | bernoulli <= 0.025, na.rm = TRUE) / 
+                            sum(!is.na(bernoulli)),
+              "poisson" = sum(poisson >= 0.975 | poisson <= 0.025, na.rm = TRUE) / 
+                          sum(!is.na(poisson)),
+              "bernoulli 90/10" = sum(bernoulli_9010 >= 0.975 | bernoulli_9010 <= 0.025, na.rm = TRUE) /
+                                  sum(!is.na(bernoulli_9010)),
+              "bernoulli low baseline" = sum(bernoulli_low >= 0.975 | bernoulli_low <= 0.025, na.rm = TRUE) /
+                                         sum(!is.na(bernoulli_low)))) %>%
+  rbind(tibble("n" = seq(1, 500)) %>%
+    group_by(n) %>%
+    mutate("bernoulli" = bayes_test(sample(binom_4, 500), 
+                                    sample(binom_4, 500), 
+                                    binom_4_prior, "bernoulli")$prob,
+           "poisson" = bayes_test(sample(pois_5, 500), 
+                                  sample(pois_5, 500), 
+                                  pois_5_prior, "poisson")$prob,
+           "bernoulli_9010" = bayes_test(sample(binom_4, 100), 
+                                         sample(binom_4, 900),
+                                         binom_4_prior, "bernoulli")$prob,
+           "bernoulli_low" = bayes_test(sample(binom_03, 500), 
+                                        sample(binom_03, 500), 
+                                        binom_03_prior, "bernoulli")$prob) %>%
+    ungroup() %>%
+    summarize("bernoulli" = sum(bernoulli >= 0.975 | bernoulli <= 0.025, na.rm = TRUE) / 
+                            sum(!is.na(bernoulli)),
+              "poisson" = sum(poisson >= 0.975 | poisson <= 0.025, na.rm = TRUE) / 
+                          sum(!is.na(poisson)),
+              "bernoulli 90/10" = sum(bernoulli_9010 >= 0.975 | bernoulli_9010 <= 0.025, na.rm = TRUE) /
+                                  sum(!is.na(bernoulli_9010)),
+              "bernoulli low baseline" = sum(bernoulli_low >= 0.975 | bernoulli_low <= 0.025, na.rm = TRUE) /
+                                         sum(!is.na(bernoulli_low)))) %>%
+  pivot_longer(everything(), names_to = "dist") %>%
+  group_by(dist) %>%
+  summarize("min" = min(value), "max" = max(value), "mid" = median(value)) %>%
+  mutate("test" = "bayes")
+
+# Plot medians as bar graph with min and max as error bars
+ggplot(rbind(hyp_type_i, bayes_type_i), aes(x = dist, y = mid, fill = test)) + 
+  geom_bar(stat = "identity", width = 0.7, position = position_dodge(), color = "grey30") +
+  scale_fill_brewer(palette = "Pastel1") + 
+  geom_errorbar(aes(ymin = min, ymax = max), width = .2, position = position_dodge(.7)) + 
+  labs(title = "Type I error rate in Bayes vs. hypothesis testing", x = "data type", y = "probability of error")
+```
+
+### Bayes tests have higher type II error rate for comparisons where there's a large actual difference and lower one for data with a 90/10 split rather than 50/50
+For type II error rate, we'll run Bayes and hypothesis tests on two samples from *different* underlying distributions, and see how many of the tests fail to detect a significant difference. We'll use the same decision rules as before (two-tailed p-value <= 0.05 for hypothesis and P(A>B) >= 97.5% or <= 2.5% for Bayes) and simulate 5 different types of data: Bernoulli data split 50/50 with a small difference, Bernoulli data split 50/50 with a large difference, Poisson data split 50/50, Bernoulli data split 90/10, and Bernoulli data with a low baseline rate.
+
+I used 3 replications of 500 tests and plotted the median with min and max as error bars as before. Interestingly, neither test has a lower type II error rate in all cases. Bayes outperforms hypothesis in the case of a 90/10 split (and binomial data with a large difference), while hypothesis is slightly better (though not always outside of error) in the other cases with a large difference (poisson and 50/50 binomial data with a large difference). This outcome seems to make intuitive sense, since the prior in a Bayes test does a poor job of describing the treatment group in cases where the treatment group is actually a lot different from control. So, it takes a little more work for your observed data to convince you away from your prior beliefs, vs. a hypothesis test which starts with no prior beliefs.
+
+```{r type_ii_error}
+# Run 100 hypothesis tests for each situation and see what % have p-value >= 0.05. Repeat process 3 times.
+hyp_type_ii <- tibble("n" = seq(1, 100)) %>%
+  group_by(n) %>%
+  mutate("bernoulli_small" = hyp_test(sample(binom_4, 2000), 
+                                      sample(binom_45, 2000), 
+                                      "bernoulli")$pvalue,
+         "bernoulli_large" = hyp_test(sample(binom_4, 500), 
+                                      sample(binom_3, 500), 
+                                      "bernoulli")$pvalue,
+         "poisson" = hyp_test(sample(pois_5, 100), 
+                              sample(pois_6, 100), 
+                              "poisson")$pvalue,
+         "bernoulli_9010" = hyp_test(sample(binom_4, 100), 
+                                     sample(binom_3, 900), 
+                                     "bernoulli")$pvalue,
+         "bernoulli_low" = hyp_test(sample(binom_03, 1500), 
+                                    sample(binom_05, 1500), 
+                                    "bernoulli")$pvalue) %>%
+  ungroup() %>%
+  summarize("bernoulli_small" = sum(bernoulli_small >= 0.05, na.rm = TRUE) / 
+                                sum(!is.na(bernoulli_small)),
+            "bernoulli_large" = sum(bernoulli_large >= 0.05, na.rm = TRUE) / 
+                                sum(!is.na(bernoulli_large)),
+            "poisson" = sum(poisson >= 0.05, na.rm = TRUE) / 
+                        sum(!is.na(poisson)),
+            "bernoulli 90/10" = sum(bernoulli_9010 >= 0.05, na.rm = TRUE) / 
+                                sum(!is.na(bernoulli_9010)),
+            "bernoulli low baseline" = sum(bernoulli_low >= 0.05, na.rm = TRUE) / 
+                                       sum(!is.na(bernoulli_low))) %>%
+  rbind(tibble("n" = seq(1, 100)) %>%
+    group_by(n) %>%
+    mutate("bernoulli_small" = hyp_test(sample(binom_4, 2000), 
+                                      sample(binom_45, 2000), 
+                                      "bernoulli")$pvalue,
+           "bernoulli_large" = hyp_test(sample(binom_4, 500), 
+                                        sample(binom_3, 500), 
+                                        "bernoulli")$pvalue,
+           "poisson" = hyp_test(sample(pois_5, 100), 
+                                sample(pois_6, 100), 
+                                "poisson")$pvalue,
+           "bernoulli_9010" = hyp_test(sample(binom_4, 100), 
+                                       sample(binom_3, 900), 
+                                       "bernoulli")$pvalue,
+           "bernoulli_low" = hyp_test(sample(binom_03, 1500), 
+                                      sample(binom_05, 1500), 
+                                      "bernoulli")$pvalue) %>%
+    ungroup() %>%
+    summarize("bernoulli_small" = sum(bernoulli_small >= 0.05, na.rm = TRUE) / 
+                                  sum(!is.na(bernoulli_small)),
+              "bernoulli_large" = sum(bernoulli_large >= 0.05, na.rm = TRUE) / 
+                                  sum(!is.na(bernoulli_large)),
+              "poisson" = sum(poisson >= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(poisson)),
+              "bernoulli 90/10" = sum(bernoulli_9010 >= 0.05, na.rm = TRUE) / 
+                                  sum(!is.na(bernoulli_9010)),
+              "bernoulli low baseline" = sum(bernoulli_low >= 0.05, na.rm = TRUE) / 
+                                         sum(!is.na(bernoulli_low)))) %>%
+  rbind(tibble("n" = seq(1, 100)) %>%
+    group_by(n) %>%
+    mutate("bernoulli_small" = hyp_test(sample(binom_4, 2000), 
+                                      sample(binom_45, 2000), 
+                                      "bernoulli")$pvalue,
+           "bernoulli_large" = hyp_test(sample(binom_4, 500), 
+                                        sample(binom_3, 500), 
+                                        "bernoulli")$pvalue,
+           "poisson" = hyp_test(sample(pois_5, 100), 
+                                sample(pois_6, 100), 
+                                "poisson")$pvalue,
+           "bernoulli_9010" = hyp_test(sample(binom_4, 100), 
+                                       sample(binom_3, 900), 
+                                       "bernoulli")$pvalue,
+           "bernoulli_low" = hyp_test(sample(binom_03, 1500), 
+                                      sample(binom_05, 1500), 
+                                      "bernoulli")$pvalue) %>%
+    ungroup() %>%
+    summarize("bernoulli_small" = sum(bernoulli_small >= 0.05, na.rm = TRUE) / 
+                                  sum(!is.na(bernoulli_small)),
+              "bernoulli_large" = sum(bernoulli_large >= 0.05, na.rm = TRUE) / 
+                                  sum(!is.na(bernoulli_large)),
+              "poisson" = sum(poisson >= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(poisson)),
+              "bernoulli 90/10" = sum(bernoulli_9010 >= 0.05, na.rm = TRUE) / 
+                                  sum(!is.na(bernoulli_9010)),
+              "bernoulli low baseline" = sum(bernoulli_low >= 0.05, na.rm = TRUE) / 
+                                         sum(!is.na(bernoulli_low)))) %>%
+  pivot_longer(everything(), names_to = "dist") %>%
+  group_by(dist) %>%
+  summarize("min" = min(value), "max" = max(value), "mid" = median(value)) %>%
+  mutate("test" = "hypothesis")
+
+# Run 100 Bayes tests for each situation and see what % have P(A > B) <= 97.5% or >= 2.5%. Repeat process 3 times.
+bayes_type_ii <- tibble("n" = seq(1, 100)) %>%
+  group_by(n) %>%
+  mutate("bernoulli_small" = bayes_test(sample(binom_4, 2000), 
+                                        sample(binom_45, 2000), 
+                                        binom_4_prior, "bernoulli")$prob,
+         "bernoulli_large" = bayes_test(sample(binom_4, 500), 
+                                  sample(binom_3, 500), 
+                                  binom_4_prior, "bernoulli")$prob,
+         "poisson" = bayes_test(sample(pois_5, 100), 
+                                sample(pois_6, 100), 
+                                pois_5_prior, "poisson")$prob,
+         "bernoulli_9010" = bayes_test(sample(binom_4, 100), 
+                                       sample(binom_3, 900), 
+                                       binom_4_prior, "bernoulli")$prob,
+         "bernoulli_low" = bayes_test(sample(binom_03, 1500), 
+                                      sample(binom_05, 1500), 
+                                      binom_03_prior, "bernoulli")$prob) %>%
+  ungroup() %>%
+  summarize("bernoulli_small" = sum(between(bernoulli_small, 0.025, 0.975), 
+                                      na.rm = TRUE) / sum(!is.na(bernoulli_small)),
+            "bernoulli_large" = sum(between(bernoulli_large, 0.025, 0.975), 
+                                    na.rm = TRUE) / sum(!is.na(bernoulli_large)),
+            "poisson" = sum(between(poisson, 0.025, 0.975), 
+                            na.rm = TRUE) / sum(!is.na(poisson)),
+            "bernoulli 90/10" = sum(between(bernoulli_9010, 0.025, 0.975), 
+                                    na.rm = TRUE) / sum(!is.na(bernoulli_9010)),
+            "bernoulli low baseline" = sum(between(bernoulli_low, 0.025, 0.975), 
+                                           na.rm = TRUE) / sum(!is.na(bernoulli_low))) %>%
+  rbind(tibble("n" = seq(1, 100)) %>%
+    group_by(n) %>%
+    mutate("bernoulli_small" = bayes_test(sample(binom_4, 2000), 
+                                        sample(binom_45, 2000), 
+                                        binom_4_prior, "bernoulli")$prob,
+           "bernoulli_large" = bayes_test(sample(binom_4, 500), 
+                                    sample(binom_3, 500), 
+                                    binom_4_prior, "bernoulli")$prob,
+           "poisson" = bayes_test(sample(pois_5, 100), 
+                                  sample(pois_6, 100), 
+                                  pois_5_prior, "poisson")$prob,
+           "bernoulli_9010" = bayes_test(sample(binom_4, 100), 
+                                         sample(binom_3, 900), 
+                                         binom_4_prior, "bernoulli")$prob,
+           "bernoulli_low" = bayes_test(sample(binom_03, 1500), 
+                                        sample(binom_05, 1500), 
+                                        binom_03_prior, "bernoulli")$prob) %>%
+    ungroup() %>%
+    summarize("bernoulli_small" = sum(between(bernoulli_small, 0.025, 0.975), 
+                                      na.rm = TRUE) / sum(!is.na(bernoulli_small)),
+              "bernoulli_large" = sum(between(bernoulli_large, 0.025, 0.975), 
+                                      na.rm = TRUE) / sum(!is.na(bernoulli_large)),
+              "poisson" = sum(between(poisson, 0.025, 0.975), 
+                              na.rm = TRUE) / sum(!is.na(poisson)),
+              "bernoulli 90/10" = sum(between(bernoulli_9010, 0.025, 0.975), 
+                                      na.rm = TRUE) / sum(!is.na(bernoulli_9010)),
+              "bernoulli low baseline" = sum(between(bernoulli_low, 0.025, 0.975), 
+                                             na.rm = TRUE) / sum(!is.na(bernoulli_low)))) %>%
+  rbind(tibble("n" = seq(1, 100)) %>%
+    group_by(n) %>%
+    mutate("bernoulli_small" = bayes_test(sample(binom_4, 2000), 
+                                        sample(binom_45, 2000), 
+                                        binom_4_prior, "bernoulli")$prob,
+           "bernoulli_large" = bayes_test(sample(binom_4, 500), 
+                                    sample(binom_3, 500), 
+                                    binom_4_prior, "bernoulli")$prob,
+           "poisson" = bayes_test(sample(pois_5, 100), 
+                                  sample(pois_6, 100), 
+                                  pois_5_prior, "poisson")$prob,
+           "bernoulli_9010" = bayes_test(sample(binom_4, 100), 
+                                         sample(binom_3, 900), 
+                                         binom_4_prior, "bernoulli")$prob,
+           "bernoulli_low" = bayes_test(sample(binom_03, 1500), 
+                                        sample(binom_05, 1500), 
+                                        binom_03_prior, "bernoulli")$prob) %>%
+    ungroup() %>%
+    summarize("bernoulli_small" = sum(between(bernoulli_small, 0.025, 0.975), 
+                                      na.rm = TRUE) / sum(!is.na(bernoulli_small)),
+              "bernoulli_large" = sum(between(bernoulli_large, 0.025, 0.975), 
+                                      na.rm = TRUE) / sum(!is.na(bernoulli_large)),
+              "poisson" = sum(between(poisson, 0.025, 0.975), 
+                              na.rm = TRUE) / sum(!is.na(poisson)),
+              "bernoulli 90/10" = sum(between(bernoulli_9010, 0.025, 0.975), 
+                                      na.rm = TRUE) / sum(!is.na(bernoulli_9010)),
+              "bernoulli low baseline" = sum(between(bernoulli_low, 0.025, 0.975), 
+                                             na.rm = TRUE) / sum(!is.na(bernoulli_low)))) %>%
+  pivot_longer(everything(), names_to = "dist") %>%
+  group_by(dist) %>%
+  summarize("min" = min(value), "max" = max(value), "mid" = median(value)) %>%
+  mutate("test" = "bayes")
+
+# Plot medians as bar graph with min and max as error bars
+ggplot(rbind(hyp_type_ii, bayes_type_ii), aes(x = dist, y = mid, fill = test)) + 
+  geom_bar(stat = "identity", width = 0.7, position = position_dodge(), color = "grey30") +
+  scale_fill_brewer(palette = "Pastel1") + 
+  geom_errorbar(aes(ymin = min, ymax = max), width = .2, position = position_dodge(.7)) + 
+  labs(title = "Type II error rate in Bayes vs. hypothesis testing", x = "data type", y = "probability of error")
+```
+
+## How does early stopping affect type I error rate?
+To simulate a test with early stopping, we'll use the same total sample size as in part 1 (1000 total draws per A/B test), but run the test every 100 samples and consider the result to be significant if *any* of those runs pass the decision rule. We can then compare this type I error to the values we found in part I. In an effort to make this not take forever to run, I'm only using 100 tests instead of 500 to estimate the type I error rate.
+The results indicate that Bayes testing with early stopping is preferable to hypothesis testing with early stopping.
+```{r early_stopping}
+# Write function to run a hypothesis test with 11 stopping points between x/2 and x (where x is total sample size) and record the minimum p-value
+hyp_earlystop <- function(A, B, distribution, x1, x2) {
+  min_p <- tibble("n1" = seq(5*x1/10, x1, x1/20),
+                  "n2" = seq(5*x2/10, x2, x2/20)) %>%
+    group_by(n1, n2) %>%
+    mutate("pvalue" = hyp_test(sample(A, n1),
+                               sample(B, n2),
+                               distribution)$pvalue) %>%
+    ungroup() %>%
+    summarize("min_p" = min(pvalue)) %>%
+    pull()
+  return(min_p)
+}
+
+# Write function to run a Bayes test with 11 stopping points between x/2 and x (where x is total sample size) and record whether there are any P(A>B) <0.025 or >0.975
+bayes_earlystop <- function(A, B, prior, distribution, x1, x2) {
+  sigdiff <- tibble("n1" = seq(5*x1/10, x1, x1/20),
+                    "n2" = seq(5*x2/10, x2, x2/20)) %>%
+    group_by(n1, n2) %>%
+    mutate("prob" = bayes_test(sample(A, n1),
+                                sample(B, n2),
+                                prior, distribution)$prob) %>%
+    ungroup() %>%
+    summarize("sigdiff" = case_when(min(prob) <= 0.025 | max(prob) >= 0.975 ~ 1,
+                                    TRUE ~ 0)) %>%
+    pull()
+  return(sigdiff)
+}
+
+# Run 100 hypothesis tests with early stopping for each situation and see what % have min p-value <= 0.05. Repeat process 3 times.
+hyp_earlystop_results <- tibble("n" = seq(1, 100)) %>%
+  group_by(n) %>%
+  mutate("bernoulli" = hyp_earlystop(binom_4, binom_4, "bernoulli", 500, 500),
+         "poisson" = hyp_earlystop(pois_5, pois_5, "poisson", 500, 500),
+         "bernoulli_9010" = hyp_earlystop(binom_4, binom_4, "bernoulli", 100, 900), 
+         "bernoulli_low" = hyp_earlystop(binom_03, binom_03, "bernoulli", 500, 500)) %>%
+  ungroup() %>%
+  summarize("bernoulli" = sum(bernoulli <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli)),
+            "poisson" = sum(poisson <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(poisson)),
+            "bernoulli 90/10" = sum(bernoulli_9010 <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli_9010)),
+            "bernoulli low baseline" = sum(bernoulli_low <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli_low))) %>%
+  rbind(tibble("n" = seq(1, 100)) %>%
+  group_by(n) %>%
+  mutate("bernoulli" = hyp_earlystop(binom_4, binom_4, "bernoulli", 500, 500),
+         "poisson" = hyp_earlystop(pois_5, pois_5, "poisson", 500, 500),
+         "bernoulli_9010" = hyp_earlystop(binom_4, binom_4, "bernoulli", 100, 900), 
+         "bernoulli_low" = hyp_earlystop(binom_03, binom_03, "bernoulli", 500, 500)) %>%
+  ungroup() %>%
+  summarize("bernoulli" = sum(bernoulli <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli)),
+            "poisson" = sum(poisson <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(poisson)),
+            "bernoulli 90/10" = sum(bernoulli_9010 <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli_9010)),
+            "bernoulli low baseline" = sum(bernoulli_low <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli_low)))) %>%
+  rbind(tibble("n" = seq(1, 100)) %>%
+  group_by(n) %>%
+  mutate("bernoulli" = hyp_earlystop(binom_4, binom_4, "bernoulli", 500, 500),
+         "poisson" = hyp_earlystop(pois_5, pois_5, "poisson", 500, 500),
+         "bernoulli_9010" = hyp_earlystop(binom_4, binom_4, "bernoulli", 100, 900), 
+         "bernoulli_low" = hyp_earlystop(binom_03, binom_03, "bernoulli", 500, 500)) %>%
+  ungroup() %>%
+  summarize("bernoulli" = sum(bernoulli <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli)),
+            "poisson" = sum(poisson <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(poisson)),
+            "bernoulli 90/10" = sum(bernoulli_9010 <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli_9010)),
+            "bernoulli low baseline" = sum(bernoulli_low <= 0.05, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli_low)))) %>%
+  pivot_longer(everything(), names_to = "dist") %>%
+  group_by(dist) %>%
+  summarize("min" = min(value), "max" = max(value), "mid" = median(value)) %>%
+  mutate("test" = "hypothesis w/ early stopping")
+
+# Run 500 Bayes tests for each situation and see what % have P(A > B) >= 97.5% or <= 2.5%. Repeat process 3 times.
+bayes_earlystop_results <- tibble("n" = seq(1, 100)) %>%
+  group_by(n) %>%
+  mutate("bernoulli" = bayes_earlystop(binom_4, binom_4, binom_4_prior, "bernoulli", 500, 500),
+         "poisson" = bayes_earlystop(pois_5, pois_5, pois_5_prior, "poisson", 500, 500),
+         "bernoulli_9010" = bayes_earlystop(binom_4, binom_4, binom_4_prior, "bernoulli", 100, 900),
+         "bernoulli_low" = bayes_earlystop(binom_03, binom_03, binom_03_prior, "bernoulli", 500, 500)) %>%
+  ungroup() %>%
+  summarize("bernoulli" = sum(bernoulli, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli)),
+            "poisson" = sum(poisson, na.rm = TRUE) / 
+                        sum(!is.na(poisson)),
+            "bernoulli 90/10" = sum(bernoulli_9010, na.rm = TRUE) /
+                                sum(!is.na(bernoulli_9010)),
+            "bernoulli low baseline" = sum(bernoulli_low, na.rm = TRUE) /
+                                       sum(!is.na(bernoulli_low))) %>%
+  rbind(tibble("n" = seq(1, 100)) %>%
+  group_by(n) %>%
+  mutate("bernoulli" = bayes_earlystop(binom_4, binom_4, binom_4_prior, "bernoulli", 500, 500),
+         "poisson" = bayes_earlystop(pois_5, pois_5, pois_5_prior, "poisson", 500, 500),
+         "bernoulli_9010" = bayes_earlystop(binom_4, binom_4, binom_4_prior, "bernoulli", 100, 900),
+         "bernoulli_low" = bayes_earlystop(binom_03, binom_03, binom_03_prior, "bernoulli", 500, 500)) %>%
+  ungroup() %>%
+  summarize("bernoulli" = sum(bernoulli, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli)),
+            "poisson" = sum(poisson, na.rm = TRUE) / 
+                        sum(!is.na(poisson)),
+            "bernoulli 90/10" = sum(bernoulli_9010, na.rm = TRUE) /
+                                sum(!is.na(bernoulli_9010)),
+            "bernoulli low baseline" = sum(bernoulli_low, na.rm = TRUE) /
+                                       sum(!is.na(bernoulli_low)))) %>%
+  rbind(tibble("n" = seq(1, 100)) %>%
+  group_by(n) %>%
+  mutate("bernoulli" = bayes_earlystop(binom_4, binom_4, binom_4_prior, "bernoulli", 500, 500),
+         "poisson" = bayes_earlystop(pois_5, pois_5, pois_5_prior, "poisson", 500, 500),
+         "bernoulli_9010" = bayes_earlystop(binom_4, binom_4, binom_4_prior, "bernoulli", 100, 900),
+         "bernoulli_low" = bayes_earlystop(binom_03, binom_03, binom_03_prior, "bernoulli", 500, 500)) %>%
+  ungroup() %>%
+  summarize("bernoulli" = sum(bernoulli, na.rm = TRUE) / 
+                          sum(!is.na(bernoulli)),
+            "poisson" = sum(poisson, na.rm = TRUE) / 
+                        sum(!is.na(poisson)),
+            "bernoulli 90/10" = sum(bernoulli_9010, na.rm = TRUE) /
+                                sum(!is.na(bernoulli_9010)),
+            "bernoulli low baseline" = sum(bernoulli_low, na.rm = TRUE) /
+                                       sum(!is.na(bernoulli_low)))) %>%
+  pivot_longer(everything(), names_to = "dist") %>%
+  group_by(dist) %>%
+  summarize("min" = min(value), "max" = max(value), "mid" = median(value)) %>%
+  mutate("test" = "bayes w/ early stopping")
+
+# Plot medians as bar graph with min and max as error bars
+ggplot(rbind(hyp_earlystop_results, bayes_earlystop_results), aes(x = dist, y = mid, fill = test)) + 
+  geom_bar(stat = "identity", width = 0.7, position = position_dodge(), color = "grey30") +
+  scale_fill_brewer(palette = "Pastel1") + 
+  geom_errorbar(aes(ymin = min, ymax = max), width = .2, position = position_dodge(.7)) + 
+  labs(title = "Type I error rate in Bayes vs. hypothesis testing with early stopping", x = "data type", y = "probability of error")
+```
+
+However, we saw earlier that, in these cases, Bayes testing had a generally lower type I error rate than hypothesis. So how much does early stopping worsen the type I error rate? When we do this comparison, we can see that early stopping impacts Bayes testing just as negatively as it impacts hypothesis testing!
+
+``` {r early_stopping_2}
+
+# Plot ratio impact of early stopping
+ratios <- tribble(
+  ~dist, ~min, ~mid, ~max, ~test, 
+  "bernoulli", 
+   with(hyp_earlystop_results, min[dist == "bernoulli"]) / with(hyp_type_i, max[dist == "bernoulli"]),
+   with(hyp_earlystop_results, min[dist == "bernoulli"]) / with(hyp_type_i, min[dist == "bernoulli"]),
+   with(hyp_earlystop_results, max[dist == "bernoulli"]) / with(hyp_type_i, min[dist == "bernoulli"]), 
+   "hypothesis",
+  "poisson", 
+   with(hyp_earlystop_results, min[dist == "poisson"]) / with(hyp_type_i, max[dist == "poisson"]),
+   with(hyp_earlystop_results, min[dist == "poisson"]) / with(hyp_type_i, min[dist == "poisson"]),
+   with(hyp_earlystop_results, max[dist == "poisson"]) / with(hyp_type_i, min[dist == "poisson"]), 
+   "hypothesis",
+  "bernoulli 90/10", 
+   with(hyp_earlystop_results, min[dist == "bernoulli 90/10"]) / with(hyp_type_i, max[dist == "bernoulli 90/10"]),
+   with(hyp_earlystop_results, min[dist == "bernoulli 90/10"]) / with(hyp_type_i, min[dist == "bernoulli 90/10"]),
+   with(hyp_earlystop_results, max[dist == "bernoulli 90/10"]) / with(hyp_type_i, min[dist == "bernoulli 90/10"]), 
+   "hypothesis",
+  "bernoulli low baseline", 
+   with(hyp_earlystop_results, min[dist == "bernoulli low baseline"]) / with(hyp_type_i, max[dist == "bernoulli low baseline"]),
+   with(hyp_earlystop_results, min[dist == "bernoulli low baseline"]) / with(hyp_type_i, min[dist == "bernoulli low baseline"]),
+   with(hyp_earlystop_results, max[dist == "bernoulli low baseline"]) / with(hyp_type_i, min[dist == "bernoulli low baseline"]), 
+   "hypothesis",
+  "bernoulli", 
+   with(bayes_earlystop_results, min[dist == "bernoulli"]) / with(bayes_type_i, max[dist == "bernoulli"]),
+   with(bayes_earlystop_results, min[dist == "bernoulli"]) / with(bayes_type_i, min[dist == "bernoulli"]),
+   with(bayes_earlystop_results, max[dist == "bernoulli"]) / with(bayes_type_i, min[dist == "bernoulli"]), 
+   "bayes",
+  "poisson", 
+   with(bayes_earlystop_results, min[dist == "poisson"]) / with(bayes_type_i, max[dist == "poisson"]),
+   with(bayes_earlystop_results, min[dist == "poisson"]) / with(bayes_type_i, min[dist == "poisson"]),
+   with(bayes_earlystop_results, max[dist == "poisson"]) / with(bayes_type_i, min[dist == "poisson"]), 
+   "bayes",
+  "bernoulli 90/10", 
+   with(bayes_earlystop_results, min[dist == "bernoulli 90/10"]) / with(bayes_type_i, max[dist == "bernoulli 90/10"]),
+   with(bayes_earlystop_results, min[dist == "bernoulli 90/10"]) / with(bayes_type_i, min[dist == "bernoulli 90/10"]),
+   with(bayes_earlystop_results, max[dist == "bernoulli 90/10"]) / with(bayes_type_i, min[dist == "bernoulli 90/10"]), 
+   "bayes",
+  "bernoulli low baseline", 
+   with(bayes_earlystop_results, min[dist == "bernoulli low baseline"]) / with(bayes_type_i, max[dist == "bernoulli low baseline"]),
+   with(bayes_earlystop_results, min[dist == "bernoulli low baseline"]) / with(bayes_type_i, min[dist == "bernoulli low baseline"]),
+   with(bayes_earlystop_results, max[dist == "bernoulli low baseline"]) / with(bayes_type_i, min[dist == "bernoulli low baseline"]), 
+   "bayes"
+  )
+
+ggplot(ratios, aes(x = dist, y = mid, fill = test)) + 
+  geom_bar(stat = "identity", width = 0.7, position = position_dodge(), color = "grey30") +
+  scale_fill_brewer(palette = "Pastel1") + 
+  geom_errorbar(aes(ymin = min, ymax = max), width = .2, position = position_dodge(.7)) + 
+  labs(title = "Impact of early stopping on Type I error rate in Bayes vs. hypothesis testing", x = "data type", y = "ratio increase in error rate from early stop")
+```
+
+How can we make sense of this result in light of the "does Bayes testing allow for peeking" debate? My take is that both sides are right, kind of. On one hand, Bayes testing never promises any level of Type I error -- all it promises is to give probabilities of distribution based on the information available. How representative of reality is the data that we've collected? -- No idea, and no promises made. So from this perspective, the result of a Bayes test *is* valid no matter how many times you peek at the data. 
+
+On the other hand, regardless of our school of thought, we do actually care about Type I error -- that is, we do actually want to minimize the probability of wrongfully concluding that two distributions are different. In these simulations, peeking increases this probability by a huge amount (up to 15-20 times!). So it definitely seems misleading to say "Bayes tests are immune to peeking". In other words: *Even though every time you peek at a Bayes test you get a valid result based on your current information, but you increase the chances of making a decision based on misleading current information*. One could argue that I'm using the wrong decision rule for my Bayes test (expected loss is much more common in the field), but you'd have the same issue no mather what decision rule you use -- you may get a *valid* expected loss, but there's no guarantee that you're getting a *true* result in the larger context.
+
+In practice, I've seen that once a Bayes test P(A>B)s comes anywhere close to the significance threshold, the day-to-day fluctuations are within a few percent at most. Given all of that, my takeaway is to keep track of Bayes test results as they come in, but to keep following the data for a couple extra days after the first positive result comes in. Essentially, "peeking is fine, but be skeptical about the outcomes of an early peek."
